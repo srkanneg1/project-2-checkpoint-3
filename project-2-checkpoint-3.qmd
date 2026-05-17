@@ -24,7 +24,7 @@ editor: visual
 
 ```{r}
 #| context: setup
-api_key <- "YPclcyK0c80DX4iKA6tccp68slCBiBCStZh3bo9d"
+api_key <- "INSERT API KEY HERE"
 
 library(tidyverse)
 library(glue)
