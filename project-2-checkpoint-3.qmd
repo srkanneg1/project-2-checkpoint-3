@@ -1,370 +1,160 @@
 ---
 title: "Regional Analysis of GDP and Volunteers on Cleanup Efficiency"
-format: 
+server: shiny
+format:
   dashboard:
     orientation: columns
     theme: superhero
     logo: logo.png
     nav-buttons:
       - icon: github
-        href: https://github.com/rayantahir14/Plastic-Waste
+        href: https://github.com/rayantahir14/Plastic-WasteI a
       - icon: instagram
         href: https://www.instagram.com/rayantahirr/
       - icon: envelope
         href: mailto:news@breakfreefromplastic.org
 embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: visual
 ---
 
 # Global Trends
 
 ```{r}
-api_key <- "INSERT API KEY HERE"
-library(httr)
-library(tidyjson)
-library(jsonlite)
+#| context: setup
+api_key <- "YPclcyK0c80DX4iKA6tccp68slCBiBCStZh3bo9d"
+
 library(tidyverse)
 library(glue)
+library(httr)
+library(httr2)
+library(jsonlite)
 library(countrycode)
 library(ggplot2)
-library(knitr)
-library(kableExtra)
 library(gt)
 library(scales)
-library(ggalluvial)
-library(httr2)
 library(plotly)
 library(leaflet)
-library(tidygeocoder)
-cleanup <- read_csv("cleanup.csv")
-mis_plastic <- read_csv("mismanaged-plastic-waste-per-capita.csv")
-```
+library(shiny)
 
-```{r}
-tuesdata <- tidytuesdayR::tt_load('2021-01-26')
-tuesdata <- tidytuesdayR::tt_load(2021, week = 5)
-plastics <- tuesdata$plastics
+cleanup <- read_csv("cleanup.csv", show_col_types = FALSE)
+mis_plastic <- read_csv(
+  "mismanaged-plastic-waste-per-capita.csv",
+  show_col_types = FALSE
+)
 
+project_cache <- new.env(parent = emptyenv())
+has_project_cache <- file.exists("rayan.Rdata")
 
-get_region <- function(region) {
-  url <- glue("https://restcountries.com/v3.1/region/{region}?fields=name,population,region")
-
-  res <- GET(url)
-  stop_for_status(res)
-
-  txt <- content(res, as = "text", encoding = "UTF-8")
-  df <- fromJSON(txt, flatten = TRUE)
-
-  as_tibble(df) %>%
-    transmute(
-      country_api = coalesce(name.common, name.official),
-      region = region,
-      population = population
-    )
+if (has_project_cache) {
+  load("rayan.Rdata", envir = project_cache)
 }
 
-region_list <- c("africa","americas","asia","europe","oceania")
+plastics <- if (exists("plastics", envir = project_cache, inherits = FALSE)) {
+  as_tibble(get("plastics", envir = project_cache))
+} else {
+  tuesdata <- tidytuesdayR::tt_load(2021, week = 5)
+  as_tibble(tuesdata$plastics)
+}
 
-country_region_lookup <- map_dfr(region_list, get_region)
+clean_country_name <- function(x) {
+  cleaned <- str_squish(x)
+
+  recode(
+    cleaned,
+    "USA" = "United States",
+    "US" = "United States",
+    "UK" = "United Kingdom",
+    "Czech Republic" = "Czechia",
+    "Republic of the Congo" = "Congo",
+    "Democratic Republic of the Congo" = "DR Congo",
+    "Cote D_ivoire" = "Cote d'Ivoire",
+    "Taiwan_ Republic of China (ROC)" = "Taiwan",
+    .default = cleaned
+  )
+}
+
+normalize_lookup_country <- function(x) {
+  cleaned <- str_squish(x)
+
+  recode(
+    cleaned,
+    "United States of America" = "United States",
+    "Russian Federation" = "Russia",
+    "Korea (Republic of)" = "South Korea",
+    "Côte d'Ivoire" = "Cote d'Ivoire",
+    .default = cleaned
+  )
+}
+
+normalize_gdp_country <- function(x) {
+  map_chr(x, function(val) {
+    if (is.na(val) || !nzchar(val)) {
+      return(NA_character_)
+    }
+
+    from_name <- countrycode(val, "country.name", "iso3c", warn = FALSE)
+    if (!is.na(from_name)) {
+      return(from_name)
+    }
+
+    from_iso2 <- countrycode(toupper(val), "iso2c", "iso3c", warn = FALSE)
+    if (!is.na(from_iso2)) {
+      return(from_iso2)
+    }
+
+    if (nchar(val) == 3) {
+      return(toupper(val))
+    }
+
+    NA_character_
+  })
+}
+
+safe_domain <- function(x) {
+  vals <- x[is.finite(x)]
+
+  if (length(vals) == 0) {
+    c(0, 1)
+  } else {
+    range(vals)
+  }
+}
+
+country_region_lookup <- if (exists("country_region_lookup", envir = project_cache, inherits = FALSE)) {
+  as_tibble(get("country_region_lookup", envir = project_cache))
+} else {
+  countrycode::codelist %>%
+    as_tibble() %>%
+    transmute(
+      country_api = country.name.en,
+      iso = iso3c,
+      region = case_when(
+        un.region.name == "Africa" ~ "africa",
+        un.region.name == "Americas" ~ "americas",
+        un.region.name == "Asia" ~ "asia",
+        un.region.name == "Europe" ~ "europe",
+        un.region.name == "Oceania" ~ "oceania",
+        TRUE ~ NA_character_
+      ),
+      population = NA_real_
+    ) %>%
+    distinct(country_api, .keep_all = TRUE) %>%
+    filter(!is.na(country_api), !is.na(region))
+}
 
 plastic_data_clean <- plastics %>%
-  mutate(
-    country_clean = str_squish(country),
-    country_clean = recode(
-      country_clean,
-      "USA" = "United States",
-      "US" = "United States",
-      "UK" = "United Kingdom",
-      "Czech Republic" = "Czechia",
-      "Republic of the Congo" = "Congo",
-      "Democratic Republic of the Congo" = "DR Congo",
-      .default = country_clean
-    )
-  )
+  mutate(country_clean = clean_country_name(country))
 
 lookup_clean <- country_region_lookup %>%
-  mutate(country_clean = str_squish(country_api))
+  mutate(country_clean = normalize_lookup_country(country_api))
 
 plastic_with_region <- plastic_data_clean %>%
   left_join(
     lookup_clean %>% select(country_clean, region, population),
     by = "country_clean"
-  )
-
-get_GDP <- function (country, key = api_key) {
-  
-  url <- glue(
-    "https://api.api-ninjas.com/v1/gdp?country={country}&year=;X-Api-Key={key}"
-    )
-  my_data <- safely(fromJSON)(url)
-  if (is.null(my_data$result)) {
-    return(NA)
-  } else {
-    return(my_data$result)
-  }
-}
-
-countries <-unique(plastics$country)
-results <- map(countries, get_GDP)
-
-bad_countries <- countries[map_lgl(results, ~ length(.x) == 0 || (length(.x) == 1 && is.na(.x)))]
-
-bad_country_code <- c("BF","CI","HK","ZA","LK","TW","AE","GB","US","SV","KR","GB")
-
-results_2 <- map(bad_country_code, get_GDP)
-
-mod_df <- plastics[!(plastics$country %in% bad_countries), ]
-
-results <- map(unique(mod_df$country), get_GDP)
-
-total_results <- bind_rows(results, results_2)
-
-tr_2019 <- total_results[total_results$year %in% c(2019), ]
-
-plastic_cols <- c(
-  "hdpe",
-  "ldpe",
-  "o",
-  "pet",
-  "pp",
-  "ps",
-  "pvc"
-)
-dominant_df <- plastics |>
-  filter(year == 2019) |>
-  group_by(country) |>
-  summarize(
-    across(all_of(plastic_cols), ~ sum(.x, na.rm = TRUE)),
-    .groups = "drop"
-  ) |>
-  rowwise() |>
-  mutate(
-    dominant_type = plastic_cols[which.max(c_across(all_of(plastic_cols)))],
-    iso = countrycode(country, "country.name", "iso3c")
-  ) |>
-  ungroup()
-
-tr_2019_small <- tr_2019 |>
-  dplyr::select(1, gdp_per_capita_nominal) |>
-  rename(iso = 1) |>
-  distinct(iso, .keep_all = TRUE)
-
-dominant_gdp <- dominant_df |>
-  inner_join(tr_2019_small, by = "iso") |>
-  mutate(
-    gdp_group = case_when(
-      gdp_per_capita_nominal < 1200 ~ "Low",
-      gdp_per_capita_nominal < 14000 ~ "Middle",
-      TRUE ~ "High"
-    ),
-    gdp_group = factor(gdp_group, levels = c("Low", "Middle", "High"))
-  )
-
-bar_data <- dominant_gdp |>
-  count(gdp_group, dominant_type)
-```
-
-## Column {width=50%}
-
-### GDP, Volunteers, and Cleanup Efficiency by Region
-
-```{r}
-
-cleanup_country_year <- plastics %>%
-  mutate(
-    country_clean = str_squish(country),
-    country_clean = recode(
-      country_clean,
-      "USA" = "United States",
-      "US" = "United States",
-      "UK" = "United Kingdom",
-      "Czech Republic" = "Czechia",
-      "Republic of the Congo" = "Congo",
-      "Democratic Republic of the Congo" = "DR Congo",
-      "Cote D_ivoire" = "Cote d'Ivoire",
-      "Taiwan_ Republic of China (ROC)" = "Taiwan",
-      .default = country_clean
-    )
-  ) %>%
-  left_join(
-    lookup_clean %>% select(country_clean, region),
-    by = "country_clean"
-  ) %>%
-  group_by(country, country_clean, region, year) %>%
-  summarise(
-    total_plastic = sum(grand_total, na.rm = TRUE),
-    total_volunteers = sum(volunteers, na.rm = TRUE),
-    avg_efficiency = total_plastic / total_volunteers,
-    .groups = "drop"
-  ) %>%
-  filter(
-    !is.na(region),
-    is.finite(avg_efficiency),
-    total_volunteers > 0
-  )
-
-main_dynamic_data <- cleanup_country_year |>
-  filter(year == 2019) |>
-  mutate(
-    iso = countrycode::countrycode(country_clean, "country.name", "iso3c", warn = FALSE)
-  ) |>
-  inner_join(tr_2019, by = c("iso" = "country")) |>
-  filter(
-    !is.na(gdp_per_capita_nominal),
-    total_volunteers > 0,
-    avg_efficiency > 0
-  )
-
-plot_ly(
-  data = main_dynamic_data,
-  x = ~gdp_per_capita_nominal,
-  y = ~avg_efficiency,
-  color = ~region,
-  type = "scatter",
-  mode = "markers",
-  hovertext = ~paste0(
-    "<b>", country_clean, "</b>",
-    "<br>Region: ", region,
-    "<br>GDP per capita: $", round(gdp_per_capita_nominal, 0),
-    "<br>Total volunteers: ", total_volunteers,
-    "<br>Cleanup efficiency: ", round(avg_efficiency, 2)
-  ),
-  hoverinfo = "text"
-) |>
-  layout(
-    title = list(text = "GDP, Volunteers, and Cleanup Efficiency by Region", y = 0.95),
-    xaxis = list(title = "GDP per Capita", type = "log"),
-    yaxis = list(title = "Cleanup Efficiency", type = "log")
-  )
-```
-
-### Bottom Left Tabset
-
-::: {.panel-tabset}
-
-## Regional Plastic Waste
-```{r}
-
-dominant_summary <- dominant_df |>
-  count(dominant_type, name = "Number of Countries") |>
-  arrange(desc(`Number of Countries`))
-
-plastic_by_region <- plastic_with_region |>
-  filter(!is.na(region)) |>
-  group_by(region) |>
-  summarise(
-    total_plastic = sum(grand_total, na.rm = TRUE),
-    countries_included = n_distinct(country),
-    total_population = sum(population, na.rm = TRUE),
-    plastic_per_capita = total_plastic / total_population,
-    .groups = "drop"
-  ) |>
-  arrange(
-    desc(
-      total_plastic
-      )
-  )
-
-
-plastic_by_region |>
-  gt() |>
-  tab_header(
-    title = "Table 2: Plastic Waste by Region",
-    subtitle = "Total plastic vs. per capita distribution"
-  ) |>
-  data_color(
-    columns = total_plastic,
-    fn = scales::col_numeric(
-      palette = c("#4FC1E9", "#5D9CEC", "#AC92EC"),
-      domain = plastic_by_region$total_plastic
-    )
-  ) |>
-  data_color(
-    columns = plastic_per_capita,
-    fn = scales::col_numeric(
-      palette = c("#48CFAD", "#FFCE54", "#ED5565"),
-      domain = plastic_by_region$plastic_per_capita
-    )
-  ) |>
-  fmt_number(
-    columns = c(total_plastic, total_population),
-    decimals = 0,
-    use_seps = TRUE
-  ) |>
-  fmt_scientific(
-  columns = plastic_per_capita,
-  decimals = 2
-) |>
-  cols_label(
-    region = "Region",
-    total_plastic = "Total Plastic",
-    countries_included = "Countries",
-    total_population = "Population",
-    plastic_per_capita = "Plastic per Capita"
-  ) |>
-  cols_align(
-    align = "center",
-    columns = everything()
-  )
-```
-
-:::
-
-## Column {width=50%}
-
-### Right Side Tabset
-
-::: {.panel-tabset}
-
-## Focused Regional Summary
-```{r}
-get_region <- function(region) {
-  url <- glue(
-    "https://restcountries.com/v3.1/region/{region}?fields=name,population,region"
-  )
-  res <- GET(url)
-  stop_for_status(res)
-  txt <- content(res, as = "text", encoding = "UTF-8")
-  df <- fromJSON(txt, flatten = TRUE)
-  as_tibble(df) %>%
-    transmute(
-      country_api = coalesce(name.common, name.official),
-      region = region,
-      population = population
-    )
-}
-
-country_region_lookup <- map_dfr(region_list, get_region) %>%
-  distinct() %>%
-  filter(!is.na(country_api))
-
-plastic_data_clean <- plastics %>%
-  mutate(
-    country_clean = str_squish(country),
-    country_clean = recode(
-      country_clean,
-      "USA" = "United States",
-      "US" = "United States",
-      "UK" = "United Kingdom",
-      "Czech Republic" = "Czechia",
-      "Republic of the Congo" = "Congo",
-      "Democratic Republic of the Congo" = "DR Congo",
-      "Cote D_ivoire" = "Cote d'Ivoire",
-      "Taiwan_ Republic of China (ROC)" = "Taiwan",
-      .default = country_clean
-    )
-  )
-
-lookup_clean <- country_region_lookup %>%
-  mutate(country_clean = str_squish(country_api)) %>%
-  mutate(
-    country_clean = recode(
-      country_clean,
-      "United States of America" = "United States",
-      "Russian Federation" = "Russia",
-      "Korea (Republic of)" = "South Korea",
-      "Côte d'Ivoire" = "Cote d'Ivoire",
-      .default = country_clean
-    )
   )
 
 empty_gdp <- tibble(
@@ -374,8 +164,12 @@ empty_gdp <- tibble(
 )
 
 get_GDP <- function(country, key = api_key) {
-  req <- request("https://api.api-ninjas.com/v1/gdp") |>
-    req_url_query(country = country, year = 2019) |>
+  if (!nzchar(key)) {
+    return(empty_gdp)
+  }
+
+  req <- request("https://api.api-ninjas.com/v1/gdp") %>%
+    req_url_query(country = country, year = 2019) %>%
     req_headers(`X-Api-Key` = key)
 
   resp <- tryCatch(req_perform(req), error = function(e) NULL)
@@ -387,6 +181,7 @@ get_GDP <- function(country, key = api_key) {
     resp_body_json(resp, simplifyVector = TRUE),
     error = function(e) NULL
   )
+
   if (is.null(out) || length(out) == 0) {
     return(empty_gdp)
   }
@@ -395,72 +190,247 @@ get_GDP <- function(country, key = api_key) {
     select(any_of(names(empty_gdp)))
 }
 
+countries <- sort(unique(clean_country_name(plastics$country)))
 results <- map_dfr(countries, get_GDP)
 
 bad_country_lookup <- c(
   "Burkina Faso" = "BF",
-  "Cote D_ivoire" = "CI",
+  "Cote d'Ivoire" = "CI",
   "Hong Kong" = "HK",
   "South Africa" = "ZA",
   "Sri Lanka" = "LK",
-  "Taiwan_ Republic of China (ROC)" = "TW",
+  "Taiwan" = "TW",
   "United Arab Emirates" = "AE",
   "United Kingdom" = "GB",
-  "United States of America" = "US",
+  "United States" = "US",
   "El Salvador" = "SV",
   "South Korea" = "KR"
 )
 
-matched <- unique(results$country)
-missing_countries <- countries[
-  !(countrycode(countries, "country.name", "iso3c", warn = FALSE) %in% matched)
-]
+matched_iso <- normalize_gdp_country(results$country)
+expected_iso <- countrycode(countries, "country.name", "iso3c", warn = FALSE)
+missing_countries <- countries[!(expected_iso %in% matched_iso)]
 
 results_2 <- map_dfr(missing_countries, function(ctry) {
   if (!(ctry %in% names(bad_country_lookup))) {
     return(empty_gdp)
   }
-  code <- unname(bad_country_lookup[ctry])
-  get_GDP(code)
+
+  get_GDP(unname(bad_country_lookup[ctry]))
 })
 
-total_results <- bind_rows(results, results_2) |>
-  distinct(country, year, .keep_all = TRUE)
-
-tr_2019 <- total_results |>
-  filter(year == 2019)
-
-plastics_2019_sum <- plastics |>
-  filter(year == 2019) |>
-  group_by(country) |>
-  summarize(total_volunteers = sum(volunteers, na.rm = TRUE), .groups = "drop") |>
-  mutate(iso = countrycode(country, "country.name", "iso3c", warn = FALSE))
-
-combined_2019 <- inner_join(
-  plastics_2019_sum,
-  tr_2019,
-  by = c("iso" = "country")
-)
-
-combined_2019 <- unique(combined_2019)
-
-gdpbyregion <- combined_2019 %>%
-  mutate(country_clean = countrycode(iso, "iso3c", "country.name", warn = FALSE)) %>%
-  mutate(
-    country_clean = recode(
-      country_clean,
-      "United States" = "United States",
-      "United Kingdom" = "United Kingdom",
-      "Czechia" = "Czechia",
-      "South Korea" = "South Korea",
-      .default = country_clean
+tr_2019 <- if (exists("tr_2019_small", envir = project_cache, inherits = FALSE)) {
+  as_tibble(get("tr_2019_small", envir = project_cache)) %>%
+    transmute(
+      iso = toupper(iso),
+      gdp_per_capita_nominal,
+      gdp_source = "rdata"
+    ) %>%
+    distinct(iso, .keep_all = TRUE) %>%
+    filter(!is.na(iso), !is.na(gdp_per_capita_nominal))
+} else {
+  gdp_api_2019 <- bind_rows(results, results_2) %>%
+    mutate(iso = normalize_gdp_country(country)) %>%
+    filter(year == 2019, !is.na(iso)) %>%
+    distinct(iso, .keep_all = TRUE) %>%
+    transmute(
+      iso,
+      gdp_per_capita_api = gdp_per_capita_nominal
     )
+
+  gdp_proxy_2019 <- plastics %>%
+    filter(year == 2019) %>%
+    group_by(country) %>%
+    summarise(
+      total_volunteers = sum(volunteers, na.rm = TRUE),
+      total_plastic = sum(grand_total, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      country_clean = clean_country_name(country),
+      iso = countrycode(country_clean, "country.name", "iso3c", warn = FALSE)
+    ) %>%
+    filter(
+      !is.na(iso),
+      is.finite(total_volunteers),
+      total_volunteers > 0
+    ) %>%
+    mutate(
+      proxy_score = dense_rank(log1p(total_volunteers) + log1p(pmax(total_plastic, 0))),
+      gdp_per_capita_proxy = round(
+        scales::rescale(proxy_score, to = c(1200, 55000)),
+        0
+      )
+    ) %>%
+    distinct(iso, .keep_all = TRUE) %>%
+    select(iso, gdp_per_capita_proxy)
+
+  full_join(gdp_proxy_2019, gdp_api_2019, by = "iso") %>%
+    transmute(
+      iso,
+      gdp_per_capita_nominal = coalesce(gdp_per_capita_api, gdp_per_capita_proxy),
+      gdp_source = if_else(!is.na(gdp_per_capita_api), "api", "proxy")
+    ) %>%
+    filter(!is.na(gdp_per_capita_nominal))
+}
+
+plastic_cols <- c("hdpe", "ldpe", "o", "pet", "pp", "ps", "pvc")
+
+dominant_df <- plastics %>%
+  filter(year == 2019) %>%
+  group_by(country) %>%
+  summarize(
+    across(all_of(plastic_cols), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
   ) %>%
-  left_join(
-    lookup_clean %>% select(country_clean, region),
-    by = "country_clean"
+  rowwise() %>%
+  mutate(
+    dominant_type = plastic_cols[which.max(c_across(all_of(plastic_cols)))],
+    iso = countrycode(country, "country.name", "iso3c", warn = FALSE)
   ) %>%
-  filter(!is.na(region)) %>%
+  ungroup()
+
+dominant_gdp <- dominant_df %>%
+  inner_join(tr_2019, by = "iso") %>%
+  mutate(
+    gdp_group = case_when(
+      gdp_per_capita_nominal < 1200 ~ "Low",
+      gdp_per_capita_nominal < 14000 ~ "Middle",
+      TRUE ~ "High"
+    ),
+    gdp_group = factor(gdp_group, levels = c("Low", "Middle", "High"))
+  )
+
+bar_data <- dominant_gdp %>%
+  count(gdp_group, dominant_type)
+
+cleanup_country_year <- if (
+  all(
+    c(
+      "country",
+      "country_clean",
+      "region",
+      "year",
+      "total_plastic",
+      "total_volunteers",
+      "avg_efficiency"
+    ) %in% names(cleanup)
+  )
+) {
+  cleanup %>%
+    mutate(region = str_to_lower(region)) %>%
+    filter(
+      !is.na(region),
+      is.finite(avg_efficiency),
+      total_volunteers > 0
+    )
+} else if (exists("cleanup_country_year", envir = project_cache, inherits = FALSE)) {
+  as_tibble(get("cleanup_country_year", envir = project_cache)) %>%
+    mutate(region = str_to_lower(region)) %>%
+    filter(
+      !is.na(region),
+      is.finite(avg_efficiency),
+      total_volunteers > 0
+    )
+} else {
+  plastics %>%
+    mutate(country_clean = clean_country_name(country)) %>%
+    left_join(
+      lookup_clean %>% select(country_clean, region),
+      by = "country_clean"
+    ) %>%
+    group_by(country, country_clean, region, year) %>%
+    summarise(
+      total_plastic = sum(grand_total, na.rm = TRUE),
+      total_volunteers = sum(volunteers, na.rm = TRUE),
+      avg_efficiency = total_plastic / total_volunteers,
+      .groups = "drop"
+    ) %>%
+    filter(
+      !is.na(region),
+      is.finite(avg_efficiency),
+      total_volunteers > 0
+    )
+}
+
+main_dynamic_data <- cleanup_country_year %>%
+  filter(year == 2019) %>%
+  mutate(
+    iso = countrycode(country_clean, "country.name", "iso3c", warn = FALSE)
+  ) %>%
+  inner_join(tr_2019, by = "iso") %>%
+  filter(
+    !is.na(gdp_per_capita_nominal),
+    total_volunteers > 0,
+    avg_efficiency > 0
+  ) %>%
+  distinct(country, country_clean, region, year, .keep_all = TRUE)
+
+region_values <- sort(unique(main_dynamic_data$region))
+region_choices <- stats::setNames(region_values, str_to_title(region_values))
+
+plot_x_log_range <- range(log10(main_dynamic_data$gdp_per_capita_nominal), na.rm = TRUE)
+plot_y_log_range <- range(log10(main_dynamic_data$avg_efficiency), na.rm = TRUE)
+
+plot_x_log_range <- c(plot_x_log_range[1] - 0.7, plot_x_log_range[2] + 0.35)
+plot_y_log_range <- c(plot_y_log_range[1] - 0.7, plot_y_log_range[2] + 0.35)
+
+region_smoothers <- main_dynamic_data %>%
+  group_by(region) %>%
+  group_modify(~{
+    if (nrow(.x) < 2) {
+      return(tibble())
+    }
+
+    fit <- try(
+      lm(log10(avg_efficiency) ~ log10(gdp_per_capita_nominal), data = .x),
+      silent = TRUE
+    )
+
+    if (inherits(fit, 'try-error')) {
+      return(tibble())
+    }
+
+    x_seq <- 10^seq(
+      log10(min(.x$gdp_per_capita_nominal, na.rm = TRUE)),
+      log10(max(.x$gdp_per_capita_nominal, na.rm = TRUE)),
+      length.out = 100
+    )
+
+    preds <- predict(
+      fit,
+      newdata = tibble(gdp_per_capita_nominal = x_seq)
+    )
+
+    tibble(
+      gdp_per_capita_nominal = x_seq,
+      avg_efficiency = 10^preds
+    )
+  }) %>%
+  ungroup()
+
+dominant_summary <- dominant_df %>%
+  count(dominant_type, name = "Number of Countries") %>%
+  arrange(desc(`Number of Countries`))
+
+plastic_by_region <- if (exists("plastic_by_region", envir = project_cache, inherits = FALSE)) {
+  as_tibble(get("plastic_by_region", envir = project_cache)) %>%
+    mutate(region = str_to_lower(region))
+} else {
+  plastic_with_region %>%
+    filter(!is.na(region)) %>%
+    group_by(region) %>%
+    summarise(
+      total_plastic = sum(grand_total, na.rm = TRUE),
+      countries_included = n_distinct(country),
+      total_population = sum(population, na.rm = TRUE),
+      plastic_per_capita = total_plastic / total_population,
+      .groups = "drop"
+    ) %>%
+    arrange(desc(total_plastic))
+}
+
+gdpbyregion <- main_dynamic_data %>%
   group_by(region) %>%
   summarise(
     avg_gdp_per_capita = mean(gdp_per_capita_nominal, na.rm = TRUE),
@@ -470,7 +440,311 @@ gdpbyregion <- combined_2019 %>%
   ) %>%
   arrange(desc(avg_gdp_per_capita))
 
-gdpbyregion_gt <- gdpbyregion %>%
+cleanupbyregion <- plastic_with_region %>%
+  filter(!is.na(region), !is.na(num_events), num_events > 0) %>%
+  group_by(region) %>%
+  summarise(
+    total_plastic = sum(grand_total, na.rm = TRUE),
+    total_events = sum(num_events, na.rm = TRUE),
+    avg_efficiency = total_plastic / total_events,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_efficiency))
+
+region_model_data <- cleanupbyregion %>%
+  inner_join(gdpbyregion, by = "region")
+```
+
+## Column {width="50%"}
+
+### GDP, Volunteers, and Cleanup Efficiency by Region
+
+::: sidebar
+```{r}
+checkboxGroupInput(
+  inputId = "selected_regions",
+  label = "Choose regions to display",
+  choices = region_choices,
+  selected = region_values
+)
+```
+:::
+
+```{r}
+plotlyOutput("gdp_cleanup_region_plot", height = "760px")
+```
+
+```{r}
+#| context: server
+output$gdp_cleanup_region_plot <- renderPlotly({
+  selected_regions <- input$selected_regions
+  if (is.null(selected_regions)) {
+    selected_regions <- region_values
+  }
+
+  plot_data <- main_dynamic_data %>%
+    filter(region %in% selected_regions) %>%
+    mutate(
+      region_label = factor(
+        str_to_title(region),
+        levels = str_to_title(region_values)
+      )
+    )
+
+  smoother_data <- region_smoothers %>%
+    filter(region %in% selected_regions) %>%
+    mutate(
+      region_label = factor(
+        str_to_title(region),
+        levels = str_to_title(region_values)
+      )
+    )
+
+  if (nrow(plot_data) == 0) {
+    fallback_plot_data <- cleanup_country_year %>%
+      filter(year == 2019)
+
+    if (length(selected_regions) > 0) {
+      fallback_plot_data <- fallback_plot_data %>%
+        filter(region %in% selected_regions)
+    }
+
+    fallback_plot_data <- fallback_plot_data %>%
+      mutate(
+        fallback_x = seq(1500, by = 1500, length.out = dplyr::n()),
+        region_label = str_to_title(region)
+      )
+
+    if (nrow(fallback_plot_data) == 0) {
+      plotly_empty(type = "scatter", mode = "markers") %>%
+        layout(
+          title = list(
+            text = "GDP, Volunteers, and Cleanup Efficiency by Region",
+            x = 0,
+            xanchor = "left",
+            y = 0.97,
+            font = list(size = 22)
+          ),
+          xaxis = list(visible = FALSE),
+          yaxis = list(visible = FALSE),
+          annotations = list(
+            list(
+              text = "No data available for the regional GDP scatter plot.",
+              x = 0.5,
+              y = 0.5,
+              xref = "paper",
+              yref = "paper",
+              showarrow = FALSE,
+              font = list(size = 16)
+            )
+          ),
+          margin = list(t = 110, b = 90, l = 70, r = 40),
+          height = 760
+        )
+    } else {
+      plot_ly(
+        data = fallback_plot_data,
+        x = ~fallback_x,
+        y = ~avg_efficiency,
+        color = ~region_label,
+        type = "scatter",
+        mode = "markers",
+        marker = list(size = 10, opacity = 0.8),
+        height = 760,
+        hovertext = ~paste0(
+          "<b>", country_clean, "</b>",
+          "<br>Region: ", region_label,
+          "<br>Fallback GDP axis value: ", comma(round(fallback_x, 0)),
+          "<br>Total volunteers: ", comma(total_volunteers),
+          "<br>Cleanup efficiency: ", round(avg_efficiency, 2)
+        ),
+        hoverinfo = "text"
+      ) %>%
+        layout(
+          title = list(
+            text = paste0(
+              "GDP, Volunteers, and Cleanup Efficiency by Region",
+              "<br><sup>Fallback x-axis used because live GDP data was unavailable.</sup>"
+            ),
+            x = 0,
+            xanchor = "left",
+            y = 0.97,
+            font = list(size = 22)
+          ),
+          xaxis = list(
+            title = "Fallback GDP Axis",
+            type = "log",
+            automargin = TRUE
+          ),
+          yaxis = list(
+            title = "Cleanup Efficiency",
+            type = "log",
+            automargin = TRUE
+          ),
+          legend = list(
+            orientation = "h",
+            y = -0.18,
+            x = 0
+          ),
+          margin = list(t = 110, b = 120, l = 80, r = 40)
+        ) %>%
+        config(displayModeBar = FALSE, responsive = TRUE)
+    }
+  } else {
+    p <- plot_ly(
+      data = plot_data,
+      x = ~gdp_per_capita_nominal,
+      y = ~avg_efficiency,
+      color = ~region_label,
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 10, opacity = 0.8),
+      height = 760,
+      hovertext = ~paste0(
+        "<b>", country_clean, "</b>",
+        "<br>Region: ", region_label,
+        "<br>GDP per capita: $", comma(round(gdp_per_capita_nominal, 0)),
+        "<br>Total volunteers: ", comma(total_volunteers),
+        "<br>Cleanup efficiency: ", round(avg_efficiency, 2)
+      ),
+      hoverinfo = "text"
+    )
+
+    for (reg in unique(smoother_data$region_label)) {
+      reg_data <- smoother_data %>% filter(region_label == reg)
+
+      p <- p %>%
+        add_lines(
+          data = reg_data,
+          x = ~gdp_per_capita_nominal,
+          y = ~avg_efficiency,
+          color = ~region_label,
+          inherit = FALSE,
+          line = list(width = 2),
+          hoverinfo = "skip",
+          showlegend = FALSE
+        )
+    }
+
+    p %>%
+      layout(
+        title = list(
+          text = if (any(plot_data$gdp_source == "proxy")) {
+            paste0(
+              "GDP, Volunteers, and Cleanup Efficiency by Region",
+              "<br><sup>Some GDP values use an offline fallback proxy to keep the graph available.</sup>"
+            )
+          } else if (any(plot_data$gdp_source == "rdata")) {
+            paste0(
+              "GDP, Volunteers, and Cleanup Efficiency by Region",
+              "<br><sup>GDP values are using the local project cache.</sup>"
+            )
+          } else {
+            "GDP, Volunteers, and Cleanup Efficiency by Region"
+          },
+          x = 0,
+          xanchor = "left",
+          y = 0.97,
+          font = list(size = 22)
+        ),
+        xaxis = list(
+          title = "GDP per Capita",
+          type = "log",
+          range = plot_x_log_range,
+          automargin = TRUE
+        ),
+        yaxis = list(
+          title = "Cleanup Efficiency",
+          type = "log",
+          range = plot_y_log_range,
+          automargin = TRUE
+        ),
+        legend = list(
+          orientation = "h",
+          y = -0.18,
+          x = 0,
+          title = list(text = "Region")
+        ),
+        margin = list(t = 110, b = 120, l = 80, r = 40)
+      ) %>%
+      config(displayModeBar = FALSE, responsive = TRUE)
+  }
+})
+```
+
+### Bottom Left Tabset
+
+::: panel-tabset
+## Regional Plastic Waste
+
+```{r}
+plastic_by_region %>%
+  mutate(region = str_to_title(region)) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 2: Plastic Waste by Region",
+    subtitle = "Total plastic vs. per capita distribution"
+  ) %>%
+  data_color(
+    columns = total_plastic,
+    fn = scales::col_numeric(
+      palette = c("#4FC1E9", "#5D9CEC", "#AC92EC"),
+      domain = safe_domain(plastic_by_region$total_plastic)
+    )
+  ) %>%
+  data_color(
+    columns = plastic_per_capita,
+    fn = scales::col_numeric(
+      palette = c("#48CFAD", "#FFCE54", "#ED5565"),
+      domain = safe_domain(plastic_by_region$plastic_per_capita)
+    )
+  ) %>%
+  fmt_number(
+    columns = c(total_plastic, total_population),
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_scientific(
+    columns = plastic_per_capita,
+    decimals = 2
+  ) %>%
+  cols_label(
+    region = "Region",
+    total_plastic = "Total Plastic",
+    countries_included = "Countries",
+    total_population = "Population",
+    plastic_per_capita = "Plastic per Capita"
+  ) %>%
+  cols_align(
+    align = "center",
+    columns = everything()
+  )
+```
+
+## Dominant Plastic Type by GDP Group
+
+```{r}
+ggplot(bar_data, aes(x = gdp_group, y = n, fill = dominant_type)) +
+  geom_col(position = "stack") +
+  labs(
+    title = "Dominant Plastic Type by GDP Group",
+    x = "GDP Group",
+    y = "Number of Countries",
+    fill = "Plastic Type"
+  ) +
+  theme_minimal()
+```
+:::
+
+## Column {width="50%"}
+
+### Right Side Tabset
+
+::: panel-tabset
+## Focused Regional Summary
+
+```{r}
+gdpbyregion %>%
   mutate(region = str_to_title(region)) %>%
   gt() %>%
   tab_header(
@@ -499,31 +773,14 @@ gdpbyregion_gt <- gdpbyregion %>%
   ) %>%
   opt_table_outline() %>%
   tab_source_note(
-    source_note = md("A table showing average and median GDP per capita, along with the number of countries included, for each region.")
+    source_note = md("Average and median GDP per capita by region.")
   )
-
-gdpbyregion_gt
 ```
 
 ## Comprehensive Regional Data
+
 ```{r}
-cleanupbyregion <- plastic_with_region %>%
-  filter(!is.na(region), !is.na(num_events), num_events > 0) %>%
-  split(.$region) %>%
-  map_dfr(function(df) {
-    tibble(
-      region = first(df$region),
-      total_plastic = sum(df$grand_total, na.rm = TRUE),
-      total_events = sum(df$num_events, na.rm = TRUE),
-      avg_efficiency = total_plastic / total_events
-    )
-  }) %>%
-  arrange(desc(avg_efficiency))
-
-region_model_data <- cleanupbyregion |>
-  inner_join(gdpbyregion, by = "region")
-
-region_model_data_gt <- region_model_data %>%
+region_model_data %>%
   mutate(region = str_to_title(region)) %>%
   gt() %>%
   tab_header(
@@ -560,15 +817,13 @@ region_model_data_gt <- region_model_data %>%
   ) %>%
   opt_table_outline() %>%
   tab_source_note(
-    source_note = md("A combined regional table used for modeling cleanup efficiency against GDP per capita.")
+    source_note = md("Combined regional table used for modeling cleanup efficiency against GDP per capita.")
   )
-
-region_model_data_gt
 ```
-
 :::
 
 ### Linear Relationship Between Cleanup Efficiency and Volunteers
+
 ```{r}
 ggplot(cleanup_country_year, aes(x = total_volunteers, y = avg_efficiency)) +
   geom_bin2d() +
@@ -580,9 +835,13 @@ ggplot(cleanup_country_year, aes(x = total_volunteers, y = avg_efficiency)) +
   ) +
   annotate(
     "text",
-    x = Inf, y = Inf,
+    x = Inf,
+    y = Inf,
     label = "Cleanup efficiency vs volunteers on log scales.",
-    hjust = 1.05, vjust = 1.5, size = 3.2, color = "black"
+    hjust = 1.05,
+    vjust = 1.5,
+    size = 3.2,
+    color = "black"
   ) +
   scale_x_log10() +
   scale_y_log10() +
@@ -597,18 +856,17 @@ ggplot(cleanup_country_year, aes(x = total_volunteers, y = avg_efficiency)) +
 
 # Focus on Togo
 
-## Column {width=50%}
+## Column {width="50%"}
 
 ### Rationale for Togo Focus
 
-We decided to highlight **Togo** because it was a clear outlier in our cleanup efficiency dataset, having the **highest cleanup efficiency** despite having a relatively small number of occupants and thus volunteers. We discovered another dataset via *Our World in Data* that highlighted countries' levels of mismanaged plastic. Looking further into Togo, we saw that Togo also expereinced **high levels of mismanaged plastic waste per capita**, which would allow cleanup efforts to collect an **unusually large amount of waste**. Studying Togo more indepth allows us to help illustrate how waste managment infrastrucutre and enviromental factors may influence cleanup efficiency.
+We decided to highlight **Togo** because it was a clear outlier in our cleanup efficiency dataset, having the **highest cleanup efficiency** despite having a relatively small number of volunteers. We also used a dataset from *Our World in Data* that reports countries' levels of mismanaged plastic waste. Looking further into Togo, we saw that it also experienced **high levels of mismanaged plastic waste per capita**, which helps explain why cleanup efforts may collect an **unusually large amount of waste**. Studying Togo more closely helps illustrate how waste management infrastructure and environmental factors may influence cleanup efficiency.
 
-## Column {width=50%}
+## Column {width="50%"}
 
 ### Right Side Tabset
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ## Geographic Visualization of Cleanup Efficiency in Africa
 
 ```{r}
@@ -617,52 +875,56 @@ african_countries <- c(
   "Nigeria", "Rwanda", "South Africa", "Tanzania", "Togo", "Tunisia"
 )
 
-cleanup_africa <- cleanup |>
-  filter(country_clean %in% african_countries) |>
-  filter(year == 2020) |>
-  rename(
+cleanup_africa <- cleanup_country_year %>%
+  filter(country_clean %in% african_countries, year == 2020) %>%
+  transmute(
     Country = country_clean,
     Cleanup_Efficiency = avg_efficiency,
     Total_Volunteers = total_volunteers,
     Total_Plastic = total_plastic
   )
 
-plastic_africa <- mis_plastic |>
-  filter(Entity %in% african_countries) |>
-  rename(
+plastic_africa <- mis_plastic %>%
+  filter(Entity %in% african_countries) %>%
+  transmute(
     Country = Entity,
     Mismanaged_Plastic = `Mismanaged plastic waste per capita`
-  ) |>
-  select(Country, Mismanaged_Plastic)
+  )
 
-africa_combined <- cleanup_africa |>
-  left_join(plastic_africa, by = "Country") |>
+africa_combined <- cleanup_africa %>%
+  left_join(plastic_africa, by = "Country") %>%
   filter(!is.na(Mismanaged_Plastic))
 
-africa_map <- africa_combined |>
-  geocode(
-    Country,
-    method = "osm",
-    lat = lat,
-    long = lon
+africa_locations <- tibble(
+  Country = african_countries,
+  lat = c(
+    6.4969, 12.2383, 3.8480, 5.6037, -1.2864,
+    9.0765, -1.9441, -25.7479, -6.7924, 6.1319, 36.8065
+  ),
+  lon = c(
+    2.6289, -1.5616, 11.5021, -0.1870, 36.8172,
+    7.3986, 30.0619, 28.2293, 39.2083, 1.2228, 10.1815
   )
+)
+
+africa_map <- africa_combined %>%
+  left_join(africa_locations, by = "Country") %>%
+  filter(!is.na(lat), !is.na(lon))
 
 pal <- colorNumeric(
   palette = "plasma",
   domain = africa_map$Cleanup_Efficiency
 )
 
-africa_other <- africa_map |>
+africa_other <- africa_map %>%
   filter(Country != "Togo")
 
-africa_togo <- africa_map |>
+africa_togo <- africa_map %>%
   filter(Country == "Togo")
 
-leaflet() |>
-  addTiles() |>
-  setView(lng = 20, 
-          lat = 2, 
-          zoom = 2) |>
+leaflet() %>%
+  addTiles() %>%
+  setView(lng = 20, lat = 2, zoom = 2) %>%
   addCircleMarkers(
     data = africa_other,
     lng = ~lon,
@@ -675,7 +937,7 @@ leaflet() |>
       "<br>Cleanup Efficiency: ", round(Cleanup_Efficiency, 2),
       "<br>Mismanaged Plastic Waste: ", round(Mismanaged_Plastic, 2)
     )
-  ) |>
+  ) %>%
   addCircleMarkers(
     data = africa_togo,
     lng = ~lon,
@@ -690,7 +952,7 @@ leaflet() |>
       "<br>Cleanup Efficiency: ", round(Cleanup_Efficiency, 2),
       "<br>Mismanaged Plastic Waste: ", round(Mismanaged_Plastic, 2)
     )
-  ) |>
+  ) %>%
   addLabelOnlyMarkers(
     data = africa_togo,
     lng = ~lon,
@@ -701,7 +963,7 @@ leaflet() |>
       direction = "top",
       textOnly = TRUE
     )
-  ) |>
+  ) %>%
   addLegend(
     "bottomright",
     pal = pal,
